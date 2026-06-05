@@ -1,0 +1,74 @@
+version: "3.9"
+
+# ============================================================
+# LOCAL DEVELOPMENT STACK
+# ============================================================
+# Starts MLflow + Prometheus + Grafana locally so you can
+# practice the full LLMOps observability stack without cloud.
+#
+# Usage:
+#   docker-compose up -d
+#   MLflow:     http://localhost:5000
+#   Prometheus: http://localhost:9090
+#   Grafana:    http://localhost:3000  (admin / admin)
+#
+# INTERVIEW TALKING POINT:
+#   "I set up a local observability stack with MLflow for
+#    experiment tracking, Prometheus for metric scraping,
+#    and Grafana for real-time dashboards — the same stack
+#    we used in production, just scaled down for development."
+# ============================================================
+
+services:
+
+  # MLflow Tracking Server
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.12.2
+    container_name: mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus — metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+
+  # Grafana — metrics dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  mlflow_data:
+  prometheus_data:
+  grafana_data:

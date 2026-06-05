@@ -1,0 +1,265 @@
+# ============================================================
+# AZURE — AKS (Azure Kubernetes Service) Deployment
+# ============================================================
+#
+# ARCHITECTURE:
+#   AKS Cluster (managed K8s control plane)
+#     └── Node Pool (Azure VMs, auto-scaled by VMSS)
+#         └── Pods (rag-service containers)
+#   Azure Application Gateway Ingress Controller (AGIC) → Pods
+#   Azure Container Registry (ACR) → stores Docker images
+#   Azure Key Vault → stores API keys
+#   Workload Identity (AAD pod-managed identity) → Pod permissions
+#
+# INTERVIEW QUESTIONS:
+#   Q: What is Azure Workload Identity?
+#   A: Azure's equivalent of AWS IRSA / GCP Workload Identity.
+#      Links a K8s ServiceAccount to an Azure Managed Identity using
+#      OIDC federation. Pod gets Azure credentials without any secrets.
+#
+#   Q: What is AGIC?
+#   A: Application Gateway Ingress Controller. Azure-native L7 load
+#      balancer with WAF, SSL termination, URL-based routing.
+#      Alternative: use nginx ingress controller + Azure Load Balancer.
+#
+#   Q: What is Azure Key Vault Provider for Secrets Store CSI Driver?
+#   A: Mounts Azure Key Vault secrets directly as files or environment
+#      variables in Pods. Secrets never touch etcd (more secure than
+#      standard K8s Secrets).
+#
+#   Q: What is an Azure Managed Identity?
+#   A: An identity automatically managed by Azure AD. No passwords or
+#      keys to rotate. Can be assigned to VMs, App Service, AKS Pods.
+# ============================================================
+
+---
+# ── Workload Identity ServiceAccount ─────────────────────────
+# BEFORE APPLYING:
+#   1. Enable OIDC issuer on AKS:
+#      az aks update --resource-group llmops-rg --name llmops-cluster --enable-oidc-issuer --enable-workload-identity
+#
+#   2. Create Managed Identity:
+#      az identity create --name llmops-rag-identity --resource-group llmops-rg
+#
+#   3. Create federated credential:
+#      az identity federated-credential create \
+#        --name llmops-federated-cred \
+#        --identity-name llmops-rag-identity \
+#        --resource-group llmops-rg \
+#        --issuer $(az aks show --name llmops-cluster --resource-group llmops-rg --query "oidcIssuerProfile.issuerUrl" -o tsv) \
+#        --subject "system:serviceaccount:llmops:rag-service-sa"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-service-sa
+  namespace: llmops
+  annotations:
+    # Client ID of the Azure Managed Identity
+    azure.workload.identity/client-id: "YOUR_MANAGED_IDENTITY_CLIENT_ID"
+  labels:
+    azure.workload.identity/use: "true"
+
+---
+# ── AKS Deployment ────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+  namespace: llmops
+  labels:
+    app: rag-service
+    cloud: azure
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rag-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: rag-service
+        cloud: azure
+        azure.workload.identity/use: "true"    # Required for workload identity
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: rag-service-sa
+
+      containers:
+        - name: rag-service
+          # Azure Container Registry URI
+          # Format: REGISTRY_NAME.azurecr.io/IMAGE:TAG
+          image: llmopsregistry.azurecr.io/rag-service:latest
+
+          env:
+            - name: CLOUD_PROVIDER
+              value: "azure"
+            - name: AZURE_SUBSCRIPTION_ID
+              value: "YOUR_SUBSCRIPTION_ID"
+            - name: AZURE_KEYVAULT_URI
+              value: "https://llmops-keyvault.vault.azure.net/"
+            # Secrets mounted from Azure Key Vault via CSI driver
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: openai_api_key
+            - name: PINECONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: pinecone_api_key
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: anthropic_api_key
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Mount Key Vault secrets as files (alternative to env vars)
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets"
+              readOnly: true
+
+      volumes:
+        # Azure Key Vault CSI driver — mounts secrets as files
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "azure-keyvault-secrets"
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: rag-service
+
+---
+# ── SecretProviderClass — Azure Key Vault CSI Driver ─────────
+# Defines which secrets to pull from Key Vault and how to expose them.
+# Install CSI driver first:
+#   az aks enable-addons --addons azure-keyvault-secrets-provider \
+#     --name llmops-cluster --resource-group llmops-rg
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: azure-keyvault-secrets
+  namespace: llmops
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: "YOUR_MANAGED_IDENTITY_CLIENT_ID"
+    keyvaultName: "llmops-keyvault"
+    tenantId: "YOUR_AZURE_TENANT_ID"
+    objects: |
+      array:
+        - |
+          objectName: openai-api-key
+          objectType: secret
+          objectAlias: openai_api_key
+        - |
+          objectName: pinecone-api-key
+          objectType: secret
+          objectAlias: pinecone_api_key
+        - |
+          objectName: anthropic-api-key
+          objectType: secret
+          objectAlias: anthropic_api_key
+  # Also sync to K8s Secret (needed for env var injection)
+  secretObjects:
+    - secretName: llm-api-secrets
+      type: Opaque
+      data:
+        - objectName: openai_api_key
+          key: openai_api_key
+        - objectName: pinecone_api_key
+          key: pinecone_api_key
+        - objectName: anthropic_api_key
+          key: anthropic_api_key
+
+---
+# ── Azure Application Gateway Ingress (AGIC) ─────────────────
+# AGIC translates K8s Ingress into Azure Application Gateway config.
+# Install: az aks enable-addons --addons ingress-appgw --name llmops-cluster \
+#            --resource-group llmops-rg --appgw-name llmops-appgw \
+#            --appgw-subnet-cidr "10.2.0.0/16"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-service-ingress
+  namespace: llmops
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    # SSL certificate from Azure Key Vault
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/appgw-ssl-certificate: "llmops-tls-cert"
+    # WAF policy (protect against OWASP top 10)
+    appgw.ingress.kubernetes.io/waf-policy-for-path: "/subscriptions/YOUR_SUB/resourceGroups/llmops-rg/providers/Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies/llmops-waf"
+    # Health probe settings
+    appgw.ingress.kubernetes.io/health-probe-path: "/health"
+    appgw.ingress.kubernetes.io/health-probe-interval: "15"
+    appgw.ingress.kubernetes.io/health-probe-timeout: "10"
+    # Connection draining
+    appgw.ingress.kubernetes.io/connection-draining: "true"
+    appgw.ingress.kubernetes.io/connection-draining-timeout: "60"
+spec:
+  rules:
+    - host: rag-api.your-domain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-service
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - rag-api.your-domain.com
+      secretName: rag-tls-cert
+
+---
+# ── AKS Node Pool for LLMOps workloads ───────────────────────
+# This is the Bicep/ARM equivalent in YAML form for reference.
+# Apply via: az aks nodepool add --resource-group llmops-rg ...
+#
+# Key settings:
+#   --node-vm-size Standard_D4s_v5   (4 vCPU, 16GB RAM)
+#   --enable-cluster-autoscaler
+#   --min-count 2 --max-count 10
+#   --labels workload-type=llmops
+#   --node-taints llmops=true:NoSchedule

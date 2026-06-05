@@ -1,0 +1,279 @@
+# ============================================================
+# AWS — EKS (Elastic Kubernetes Service) Deployment
+# ============================================================
+#
+# ARCHITECTURE:
+#   EKS Cluster (managed K8s control plane)
+#     └── Node Group (EC2 instances, auto-scaled by Karpenter)
+#         └── Pods (rag-service containers)
+#   ALB (Application Load Balancer) → routes traffic to Pods
+#   ECR (Elastic Container Registry) → stores Docker images
+#   Secrets Manager → stores API keys (not plain K8s Secrets)
+#   IAM IRSA → Pod-level AWS permissions (no hardcoded keys)
+#
+# INTERVIEW QUESTIONS:
+#   Q: What is IRSA?
+#   A: IAM Roles for Service Accounts. Lets K8s Pods assume an IAM Role
+#      without any hardcoded AWS credentials. The Pod gets a short-lived
+#      token, exchanges it for AWS credentials automatically.
+#      Much safer than mounting AWS_ACCESS_KEY_ID in environment.
+#
+#   Q: What is Karpenter?
+#   A: AWS node autoscaler that provisions EC2 nodes in seconds (vs
+#      Cluster Autoscaler which takes minutes). Chooses cheapest instance
+#      type that fits the pending Pod's resource requests.
+#
+#   Q: What is the AWS Load Balancer Controller?
+#   A: A K8s controller that watches Ingress resources and automatically
+#      creates AWS ALBs + Target Groups. Replaces the classic ELB.
+# ============================================================
+
+# ── Step 1: Create EKS cluster ────────────────────────────────
+# Run: bash k8s/scripts/aws_setup.sh
+# Or manually with eksctl:
+#
+# eksctl create cluster \
+#   --name llmops-cluster \
+#   --region us-east-1 \
+#   --nodegroup-name llmops-nodes \
+#   --node-type m5.xlarge \
+#   --nodes 3 --nodes-min 2 --nodes-max 10 \
+#   --managed
+# ─────────────────────────────────────────────────────────────
+
+---
+# ── ServiceAccount with IRSA ──────────────────────────────────
+# This lets the RAG Pod call AWS services (Secrets Manager, S3)
+# without any hardcoded credentials.
+#
+# BEFORE APPLYING: replace YOUR_AWS_ACCOUNT_ID and YOUR_OIDC_ID
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-service-sa
+  namespace: llmops
+  annotations:
+    # This annotation is what links the K8s SA to the AWS IAM Role
+    eks.amazonaws.com/role-arn: arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/llmops-rag-role
+
+---
+# ── AWS-specific Deployment overlay ──────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+  namespace: llmops
+  labels:
+    app: rag-service
+    cloud: aws
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rag-service
+  template:
+    metadata:
+      labels:
+        app: rag-service
+        cloud: aws
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: rag-service-sa    # ← Uses IRSA ServiceAccount
+
+      containers:
+        - name: rag-service
+          # ECR image URI — always use your ECR registry, not Docker Hub, in production
+          # Format: AWS_ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/REPO:TAG
+          image: YOUR_AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/rag-service:latest
+
+          env:
+            - name: CLOUD_PROVIDER
+              value: "aws"
+            - name: AWS_REGION
+              value: "us-east-1"
+            # Fetch secrets from AWS Secrets Manager at runtime (via External Secrets Operator)
+            # See: aws-external-secrets.yaml
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets    # Synced from AWS Secrets Manager
+                  key: openai_api_key
+            - name: PINECONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: pinecone_api_key
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+
+      # Schedule on nodes with this label (set by Karpenter node pool)
+      nodeSelector:
+        workload-type: "llmops"
+
+      tolerations:
+        - key: "llmops"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: rag-service
+
+---
+# ── AWS ALB Ingress ───────────────────────────────────────────
+# The AWS Load Balancer Controller watches this and creates an ALB.
+# Install controller first:
+#   helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#     -n kube-system --set clusterName=llmops-cluster
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-service-ingress
+  namespace: llmops
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing        # Public ALB
+    alb.ingress.kubernetes.io/target-type: ip                # Route to Pod IPs directly (faster)
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:YOUR_ACCOUNT:certificate/YOUR_CERT_ARN
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # WAF integration (protect against injection attacks)
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:us-east-1:YOUR_ACCOUNT:regional/webacl/YOUR_WAF
+    # Health check
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    # Sticky sessions (useful for RAG caching)
+    alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=true,stickiness.lb_cookie.duration_seconds=3600
+spec:
+  rules:
+    - host: rag-api.your-domain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-service
+                port:
+                  number: 80
+
+---
+# ── External Secrets Operator — sync AWS Secrets Manager → K8s Secret ──
+# Keeps secrets out of Git. AWS Secrets Manager is the source of truth.
+# Install: helm install external-secrets external-secrets/external-secrets -n external-secrets
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: llm-api-secrets
+  namespace: llmops
+spec:
+  refreshInterval: 1h                    # Re-sync every hour
+  secretStoreRef:
+    name: aws-secrets-store
+    kind: ClusterSecretStore
+  target:
+    name: llm-api-secrets                # Creates this K8s Secret
+    creationPolicy: Owner
+  data:
+    - secretKey: openai_api_key
+      remoteRef:
+        key: llmops/api-keys             # Path in AWS Secrets Manager
+        property: OPENAI_API_KEY
+    - secretKey: pinecone_api_key
+      remoteRef:
+        key: llmops/api-keys
+        property: PINECONE_API_KEY
+    - secretKey: anthropic_api_key
+      remoteRef:
+        key: llmops/api-keys
+        property: ANTHROPIC_API_KEY
+
+---
+# ── Karpenter NodePool (auto-provisions EC2 nodes) ────────────
+# Karpenter picks the cheapest instance type that fits pending Pods.
+# Replaces Cluster Autoscaler — much faster and smarter.
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: llmops-nodepool
+spec:
+  template:
+    metadata:
+      labels:
+        workload-type: llmops
+    spec:
+      taints:
+        - key: llmops
+          value: "true"
+          effect: NoSchedule
+      nodeClassRef:
+        apiVersion: karpenter.k8s.aws/v1beta1
+        kind: EC2NodeClass
+        name: llmops-nodeclass
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand", "spot"]   # Use spot instances for cost savings
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["m", "c"]              # Memory and compute optimised
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["xlarge", "2xlarge", "4xlarge"]
+  limits:
+    cpu: "200"                            # Max 200 vCPUs across all nodes
+    memory: 400Gi
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+
+---
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: llmops-nodeclass
+spec:
+  amiFamily: AL2
+  role: "KarpenterNodeRole-llmops-cluster"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "llmops-cluster"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "llmops-cluster"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 50Gi
+        volumeType: gp3
+        encrypted: true

@@ -1,0 +1,267 @@
+# ============================================================
+# GCP — GKE (Google Kubernetes Engine) Deployment
+# ============================================================
+#
+# ARCHITECTURE:
+#   GKE Autopilot Cluster (Google manages nodes for you)
+#     └── Pods (rag-service containers)
+#   Google Cloud Load Balancer (HTTPS) → Pods
+#   Artifact Registry → stores Docker images
+#   Secret Manager → stores API keys
+#   Workload Identity → Pod-level GCP permissions (no key files)
+#
+# INTERVIEW QUESTIONS:
+#   Q: What is Workload Identity?
+#   A: GCP's equivalent of AWS IRSA. Links a K8s ServiceAccount to a
+#      GCP Service Account. The Pod gets GCP permissions without any
+#      JSON key files — more secure and easier to rotate.
+#
+#   Q: What is GKE Autopilot vs Standard?
+#   A: Autopilot = Google manages nodes entirely. You only define Pods.
+#      Google provisions, patches, and scales nodes automatically.
+#      Standard = you manage node pools (more control, more work).
+#      For LLMOps: Autopilot is great — focus on your app, not infra.
+#
+#   Q: What is Cloud Endpoints / NEG?
+#   A: NEG (Network Endpoint Group) routes traffic directly to Pod IPs
+#      rather than to node IPs + NodePort. Lower latency, more precise
+#      health checks. Required for GKE Ingress with BackendConfig.
+# ============================================================
+
+---
+# ── Workload Identity ServiceAccount ─────────────────────────
+# Links K8s ServiceAccount → GCP Service Account (no key files needed)
+#
+# BEFORE APPLYING:
+#   1. Create GCP SA: gcloud iam service-accounts create llmops-rag-sa
+#   2. Grant permissions: gcloud projects add-iam-policy-binding PROJECT_ID \
+#        --member="serviceAccount:llmops-rag-sa@PROJECT_ID.iam.gserviceaccount.com" \
+#        --role="roles/secretmanager.secretAccessor"
+#   3. Allow K8s SA to impersonate GCP SA:
+#      gcloud iam service-accounts add-iam-policy-binding \
+#        llmops-rag-sa@PROJECT_ID.iam.gserviceaccount.com \
+#        --member="serviceAccount:PROJECT_ID.svc.id.goog[llmops/rag-service-sa]" \
+#        --role="roles/iam.workloadIdentityUser"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-service-sa
+  namespace: llmops
+  annotations:
+    # This annotation is what activates Workload Identity
+    iam.gke.io/gcp-service-account: llmops-rag-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com
+
+---
+# ── GKE Deployment ────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+  namespace: llmops
+  labels:
+    app: rag-service
+    cloud: gcp
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rag-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: rag-service
+        cloud: gcp
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: rag-service-sa
+
+      containers:
+        - name: rag-service
+          # Artifact Registry URI
+          # Format: REGION-docker.pkg.dev/PROJECT_ID/REPO/IMAGE:TAG
+          image: us-central1-docker.pkg.dev/YOUR_PROJECT_ID/llmops/rag-service:latest
+
+          env:
+            - name: CLOUD_PROVIDER
+              value: "gcp"
+            - name: GCP_PROJECT_ID
+              value: "YOUR_PROJECT_ID"
+            - name: GCP_REGION
+              value: "us-central1"
+            # Secrets fetched from GCP Secret Manager via External Secrets Operator
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: openai_api_key
+            - name: PINECONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: pinecone_api_key
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: anthropic_api_key
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+
+      # GKE Autopilot: no node selectors needed — GCP handles scheduling
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: rag-service
+
+---
+# ── BackendConfig (GCP-specific health check & CDN settings) ──
+# Controls how the Google Cloud Load Balancer healthchecks Pods
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: rag-backend-config
+  namespace: llmops
+spec:
+  healthCheck:
+    checkIntervalSec: 15
+    timeoutSec: 10
+    healthyThreshold: 1
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /health
+    port: 8080
+  # Cloud CDN for caching static responses (cost saving for common queries)
+  cdn:
+    enabled: false           # Enable for static content only
+  # Connection draining — give existing requests time to complete
+  connectionDraining:
+    drainingTimeoutSec: 60
+  # Session affinity (helps with semantic caching)
+  sessionAffinity:
+    affinityType: "CLIENT_IP"
+    affinityCookieTtlSec: 3600
+
+---
+# ── GKE Ingress with Google-managed SSL certificate ───────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-service-ingress
+  namespace: llmops
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "llmops-static-ip"    # Reserve static IP first
+    networking.gke.io/managed-certificates: "rag-managed-cert"          # Google-managed TLS cert
+    networking.gke.io/v1beta1.FrontendConfig: "rag-frontend-config"
+    # Use NEG for direct Pod routing (lower latency)
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "rag-backend-config"}'
+spec:
+  rules:
+    - host: rag-api.your-domain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-service
+                port:
+                  number: 80
+
+---
+# ── Google-managed TLS certificate (auto-renewed) ─────────────
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: rag-managed-cert
+  namespace: llmops
+spec:
+  domains:
+    - rag-api.your-domain.com
+
+---
+# ── FrontendConfig (HTTPS redirect) ──────────────────────────
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: rag-frontend-config
+  namespace: llmops
+spec:
+  redirectToHttps:
+    enabled: true
+    responseCodeName: "MOVED_PERMANENTLY_DEFAULT"
+
+---
+# ── External Secrets — sync GCP Secret Manager → K8s Secret ──
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: llm-api-secrets
+  namespace: llmops
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secrets-store
+    kind: ClusterSecretStore
+  target:
+    name: llm-api-secrets
+    creationPolicy: Owner
+  data:
+    - secretKey: openai_api_key
+      remoteRef:
+        key: llmops-openai-api-key          # Secret name in GCP Secret Manager
+    - secretKey: pinecone_api_key
+      remoteRef:
+        key: llmops-pinecone-api-key
+    - secretKey: anthropic_api_key
+      remoteRef:
+        key: llmops-anthropic-api-key
+
+---
+# ── ClusterSecretStore for GCP Secret Manager ─────────────────
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: gcp-secrets-store
+spec:
+  provider:
+    gcpsm:
+      projectID: YOUR_PROJECT_ID
+      auth:
+        workloadIdentity:
+          clusterLocation: us-central1
+          clusterName: llmops-cluster
+          serviceAccountRef:
+            name: rag-service-sa
+            namespace: llmops

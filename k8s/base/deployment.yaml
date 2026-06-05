@@ -1,0 +1,174 @@
+# ============================================================
+# BASE — RAG Service Deployment
+# ============================================================
+#
+# WHAT THIS IS:
+#   The core Kubernetes Deployment manifest for the RAG API service.
+#   This is the "base" layer — shared by ALL cloud providers and
+#   Minikube. Each provider folder adds its own overlay on top.
+#
+# INTERVIEW QUESTIONS THIS COVERS:
+#   Q: What is a Kubernetes Deployment?
+#   A: Declares the desired state for a set of Pods. K8s continuously
+#      reconciles actual state to match desired state. If a Pod dies,
+#      K8s restarts it automatically.
+#
+#   Q: What is a Pod?
+#   A: The smallest deployable unit in K8s — one or more containers
+#      that share network and storage. One container per Pod is typical.
+#
+#   Q: What is resource requests vs limits?
+#   A: requests = minimum guaranteed (used for scheduling).
+#      limits = maximum allowed (container is killed if exceeded).
+#      Always set both — prevents noisy neighbour problems.
+#
+#   Q: What are liveness vs readiness probes?
+#   A: liveness  = "is the app still alive?" (kill and restart if fails)
+#      readiness = "is the app ready to receive traffic?" (remove from
+#                  load balancer if fails, do NOT restart)
+#
+#   Q: What are environment variables injected from Secrets?
+#   A: Never hardcode secrets in manifests. Use secretKeyRef to mount
+#      values from Kubernetes Secrets at runtime.
+# ============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+  namespace: llmops
+  labels:
+    app: rag-service
+    version: "1.0.0"
+    tier: backend
+    managed-by: llmops-team
+spec:
+  replicas: 3                    # Start with 3 — HPA will scale this up/down
+  selector:
+    matchLabels:
+      app: rag-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1          # At most 1 Pod unavailable during update
+      maxSurge: 1                # At most 1 extra Pod during update
+      # WHY: Zero-downtime deploys. Old pods removed only after new ones are healthy.
+  template:
+    metadata:
+      labels:
+        app: rag-service
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"    # Tell Prometheus to scrape this Pod
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Security: run as non-root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: rag-service
+          image: rag-service:latest     # Override per environment (AWS/GCP/Azure/Minikube)
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 8000
+
+          # ── Environment variables ──────────────────────────
+          env:
+            - name: PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: rag-config
+                  key: mlflow_uri
+            # Secrets — NEVER hardcode API keys in manifests
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: openai_api_key
+            - name: PINECONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: pinecone_api_key
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: anthropic_api_key
+
+          # ── Resource management ───────────────────────────
+          # INTERVIEW TIP: Always set both requests and limits.
+          # Requests = what Kubernetes reserves on the node.
+          # Limits = maximum the container can use.
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"         # 250 millicores = 0.25 CPU
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"        # 2 full CPUs max
+
+          # ── Health probes ─────────────────────────────────
+          # startupProbe: give the app time to boot before liveness kicks in
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 30   # Allow 30 × 10s = 5 min startup time
+            periodSeconds: 10
+
+          # livenessProbe: is the app still alive? (restart if fails)
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+
+          # readinessProbe: is the app ready for traffic? (remove from LB if fails)
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # ── Volume mounts ─────────────────────────────────
+          volumeMounts:
+            - name: model-cache
+              mountPath: /app/cache
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: model-cache
+          emptyDir:
+            sizeLimit: "5Gi"
+        - name: tmp
+          emptyDir: {}
+
+      # Graceful shutdown — give app 30s to finish in-flight requests
+      terminationGracePeriodSeconds: 30
+
+      # Spread Pods across availability zones for high availability
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: rag-service

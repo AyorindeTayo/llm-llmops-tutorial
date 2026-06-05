@@ -1,0 +1,177 @@
+# ============================================================
+# BASE — Namespace
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llmops
+  labels:
+    team: mlops
+    environment: production
+
+---
+# ============================================================
+# BASE — ConfigMap (non-secret configuration)
+# ============================================================
+# INTERVIEW TIP:
+#   ConfigMap = non-sensitive key-value config (URLs, feature flags)
+#   Secret    = sensitive data (API keys, passwords) — base64 encoded
+#               In production: use AWS Secrets Manager / GCP Secret Manager
+#               / Azure Key Vault instead of plain K8s Secrets
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-config
+  namespace: llmops
+data:
+  mlflow_uri: "http://mlflow-service:5000"
+  pinecone_environment: "us-east-1-aws"
+  chunk_size: "500"
+  top_k: "3"
+  cache_ttl_seconds: "3600"
+  max_tokens: "1000"
+  log_level: "INFO"
+
+---
+# ============================================================
+# BASE — Service (internal load balancer / service discovery)
+# ============================================================
+#
+# INTERVIEW QUESTIONS:
+#   Q: What is a Kubernetes Service?
+#   A: A stable network endpoint for a set of Pods.
+#      Pods come and go (different IPs each time), but the Service
+#      IP stays constant. Other services use the Service name as DNS.
+#
+#   Q: ClusterIP vs NodePort vs LoadBalancer?
+#   A: ClusterIP   = internal only (default) — for service-to-service
+#      NodePort     = opens a port on every node — for local dev/testing
+#      LoadBalancer = provisions a cloud load balancer (AWS ALB, GCP LB)
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service
+  namespace: llmops
+  labels:
+    app: rag-service
+spec:
+  selector:
+    app: rag-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP       # Internal — Ingress/ALB handles external traffic
+
+---
+# ============================================================
+# BASE — HorizontalPodAutoscaler (HPA)
+# ============================================================
+#
+# INTERVIEW QUESTIONS:
+#   Q: What is HPA?
+#   A: Automatically scales the number of Pods based on CPU/memory
+#      or custom metrics (requests/sec, queue depth).
+#      Checks every 15 seconds by default.
+#
+#   Q: How does HPA decide when to scale?
+#   A: desiredReplicas = currentReplicas × (currentMetric / targetMetric)
+#      If CPU is at 80% and target is 50% → scale up by 80/50 = 1.6x
+#
+#   Q: What is KEDA?
+#   A: Kubernetes Event-Driven Autoscaling — extends HPA with 50+
+#      scalers (Kafka queue depth, Prometheus metrics, SQS queue length).
+#      Great for LLM workloads where you want to scale on request queue depth.
+# ============================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-service-hpa
+  namespace: llmops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rag-service
+  minReplicas: 2          # Never go below 2 (high availability)
+  maxReplicas: 20         # Cap at 20 for cost control
+  metrics:
+    # Scale on CPU
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60    # Scale up when average CPU > 60%
+    # Scale on memory
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Scale on requests per second (requires Prometheus adapter)
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"       # Scale when >100 req/sec per Pod
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60      # Wait 60s before scaling up again
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60               # Add max 4 Pods per minute
+    scaleDown:
+      stabilizationWindowSeconds: 300     # Wait 5 min before scaling down (avoid thrashing)
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120              # Remove max 2 Pods per 2 minutes
+
+---
+# ============================================================
+# BASE — Ingress (routes external HTTP traffic to the service)
+# ============================================================
+# Note: The actual IngressClass annotation differs per cloud:
+#   AWS:   kubernetes.io/ingress.class: alb
+#   GCP:   kubernetes.io/ingress.class: gce
+#   Azure: kubernetes.io/ingress.class: azure/application-gateway
+#   Local: kubernetes.io/ingress.class: nginx
+# Each provider's overlay sets the correct annotation.
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-service-ingress
+  namespace: llmops
+  annotations:
+    # Rate limiting (works with nginx ingress controller)
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "50"
+spec:
+  rules:
+    - host: rag-api.your-domain.com      # Override per environment
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-service
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - rag-api.your-domain.com
+      secretName: rag-tls-cert

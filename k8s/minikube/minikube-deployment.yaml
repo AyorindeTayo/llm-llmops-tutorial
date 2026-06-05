@@ -1,0 +1,272 @@
+# ============================================================
+# LOCAL — Minikube Deployment (Development & Learning)
+# ============================================================
+#
+# WHAT IS MINIKUBE?
+#   Minikube runs a single-node Kubernetes cluster inside a VM or
+#   container on your laptop. Perfect for:
+#     - Learning Kubernetes concepts
+#     - Developing and testing K8s manifests before cloud deployment
+#     - Running the full LLMOps stack offline
+#
+# INTERVIEW QUESTIONS:
+#   Q: From your CV — "ML infrastructure migration Minikube → EKS"?
+#   A: We started with Minikube for local development and testing.
+#      Once the architecture was validated, we migrated to EKS for
+#      production. Same YAML manifests, different ingress + image registry.
+#      Minikube gave us a fast feedback loop before spending on cloud.
+#
+#   Q: What are the main differences between Minikube and cloud K8s?
+#   A: Minikube = single node, no HA, no real LoadBalancer (uses NodePort
+#      or minikube tunnel), local image registry, no cloud IAM.
+#      Cloud K8s = multi-node, multi-AZ HA, real LoadBalancer, managed
+#      node scaling, cloud-native secrets management.
+#
+#   Q: How do you use a local Docker image in Minikube?
+#   A: eval $(minikube docker-env) then docker build — this builds the
+#      image directly inside Minikube's Docker daemon so it's available
+#      to the cluster without pushing to a registry.
+# ============================================================
+
+---
+# ── Namespace ─────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llmops
+
+---
+# ── ConfigMap ─────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-config
+  namespace: llmops
+data:
+  mlflow_uri: "http://mlflow-service.llmops.svc.cluster.local:5000"
+  chunk_size: "500"
+  top_k: "3"
+  log_level: "DEBUG"      # Debug logging for local development
+
+---
+# ── Secrets (plain base64 for local dev — NEVER do this in production)
+# INTERVIEW TIP: In production always use:
+#   AWS → AWS Secrets Manager + External Secrets Operator
+#   GCP → GCP Secret Manager + Workload Identity
+#   Azure → Azure Key Vault + CSI driver
+# For local Minikube, plain K8s Secrets are acceptable.
+#
+# To create: kubectl create secret generic llm-api-secrets \
+#   --from-literal=openai_api_key=sk-... \
+#   --from-literal=pinecone_api_key=... \
+#   -n llmops
+#
+# The Secret below is a TEMPLATE — fill in real base64 values:
+#   echo -n 'sk-your-key' | base64
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-api-secrets
+  namespace: llmops
+type: Opaque
+data:
+  openai_api_key: REPLACE_WITH_BASE64_ENCODED_KEY
+  pinecone_api_key: REPLACE_WITH_BASE64_ENCODED_KEY
+  anthropic_api_key: REPLACE_WITH_BASE64_ENCODED_KEY
+
+---
+# ── RAG Service Deployment (Minikube) ────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+  namespace: llmops
+  labels:
+    app: rag-service
+    environment: local
+spec:
+  replicas: 1              # Single replica is fine for local dev
+  selector:
+    matchLabels:
+      app: rag-service
+  template:
+    metadata:
+      labels:
+        app: rag-service
+        environment: local
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+        - name: rag-service
+          # Use Never or IfNotPresent so Minikube uses the locally built image
+          # Build with: eval $(minikube docker-env) && docker build -t rag-service:local .
+          image: rag-service:local
+          imagePullPolicy: Never       # ← CRITICAL for local images in Minikube
+
+          env:
+            - name: ENVIRONMENT
+              value: "local"
+            - name: CLOUD_PROVIDER
+              value: "minikube"
+            - name: PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: rag-config
+                  key: log_level
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: rag-config
+                  key: mlflow_uri
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: openai_api_key
+            - name: PINECONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-secrets
+                  key: pinecone_api_key
+
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8000
+              name: metrics
+
+          # Looser resource limits for laptop development
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+---
+# ── MLflow Deployment (runs inside Minikube) ──────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: llmops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:v2.12.2
+          command:
+            - mlflow
+            - server
+            - --host=0.0.0.0
+            - --port=5000
+            - --backend-store-uri=sqlite:///mlflow/mlflow.db
+            - --default-artifact-root=/mlflow/artifacts
+          ports:
+            - containerPort: 5000
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: mlflow-storage
+              mountPath: /mlflow
+      volumes:
+        - name: mlflow-storage
+          emptyDir: {}     # Data lost on Pod restart — use PVC for persistence
+
+---
+# ── Services ──────────────────────────────────────────────────
+# NodePort: exposes the service on a port on the Minikube VM
+# Access via: minikube service rag-service -n llmops
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service
+  namespace: llmops
+spec:
+  selector:
+    app: rag-service
+  type: NodePort            # NodePort for Minikube (no real LoadBalancer available)
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: 30080       # Fixed port so URL doesn't change on restart
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+      nodePort: 30081
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-service
+  namespace: llmops
+spec:
+  selector:
+    app: mlflow
+  type: NodePort
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+      nodePort: 30500       # Access MLflow at http://$(minikube ip):30500
+
+---
+# ── Ingress with Minikube nginx addon ─────────────────────────
+# Enable with: minikube addons enable ingress
+# Then add to /etc/hosts: $(minikube ip) rag-api.local
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-service-ingress
+  namespace: llmops
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # Rate limiting for local testing
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+spec:
+  rules:
+    - host: rag-api.local          # Add to /etc/hosts: $(minikube ip) rag-api.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-service
+                port:
+                  number: 80
