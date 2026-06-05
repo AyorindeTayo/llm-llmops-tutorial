@@ -1,7 +1,5 @@
 # 🚀 LLM & LLMOps End-to-End Tutorial
-### *Interview-Ready Mastery for Machine Learning & LLMOps Engineers*
-
-> **Built from real CV experience** — covers every LLM/LLMOps skill listed in Ayorinde Olanipekun's ML Engineering profile. Work through this repo and you'll be able to confidently answer any interview question on these topics.
+topics.
 
 ---
 
